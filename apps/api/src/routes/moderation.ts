@@ -6,6 +6,11 @@ import { AppError, conflict, notFound } from "../errors";
 import { requireAdmin, requireModerator } from "../auth";
 import { recordAudit } from "../audit";
 import { notifyUser } from "../notifications";
+import {
+  countOpenReports,
+  decideTargetVisibility,
+  REPORT_HIDE_THRESHOLD
+} from "../report-visibility";
 
 export async function moderationRoutes(app: FastifyInstance) {
   app.get("/moderation/queue", { preHandler: requireModerator }, async () => {
@@ -340,36 +345,79 @@ export async function moderationRoutes(app: FastifyInstance) {
       notes: z.string().trim().max(1000).optional()
     }).parse(request.body);
 
-    await transaction(async (client) => {
-      const reportResult = await client.query<{ target_type: string; target_id: string; reporter_id: string }>(
+    const outcome = await transaction(async (client) => {
+      const reportResult = await client.query<{ target_type: "feature" | "comment"; target_id: string; reporter_id: string }>(
         "SELECT target_type, target_id, reporter_id FROM reports WHERE id = $1 AND status = 'open' FOR UPDATE",
         [params.id]
       );
       const report = reportResult.rows[0];
       if (!report) throw notFound("Open report not found");
 
-      if (input.action === "hide") {
-        const table = report.target_type === "feature" ? "map_features" : "comments";
-        await client.query(`UPDATE ${table} SET status = 'hidden', updated_at = now() WHERE id = $1`, [report.target_id]);
-      }
-      if (input.action === "restore") {
-        if (report.target_type === "feature") {
-          await client.query("UPDATE map_features SET status = 'published', updated_at = now() WHERE id = $1 AND current_revision_id IS NOT NULL", [report.target_id]);
-        } else {
-          await client.query("UPDATE comments SET status = 'published', updated_at = now() WHERE id = $1", [report.target_id]);
-        }
-      }
-
+      // 先结算本条举报，保证后续开放举报计数口径一致
       await client.query(
         `UPDATE reports SET status = $2, resolved_by = $3, resolved_at = now() WHERE id = $1`,
         [params.id, input.status, request.user!.id]
       );
+
+      // 统一重算：开放举报仍达阈值时，任何个别处置（含 restore）都不得恢复目标
+      const openReports = await countOpenReports(client, report.target_type, report.target_id);
+      const decision = decideTargetVisibility(input.action, openReports);
+      const table = report.target_type === "feature" ? "map_features" : "comments";
+
+      if (decision === "hidden") {
+        const hidden = await client.query(
+          `UPDATE ${table} SET status = 'hidden', updated_at = now()
+           WHERE id = $1 AND status = 'published' AND deleted_at IS NULL`,
+          [report.target_id]
+        );
+        if (hidden.rowCount && input.action !== "hide") {
+          await recordAudit(client, {
+            actorId: request.user!.id,
+            action: "report.threshold_hidden",
+            resourceType: report.target_type,
+            resourceId: report.target_id,
+            metadata: { openReports, threshold: REPORT_HIDE_THRESHOLD, source: "report_resolve" }
+          });
+        }
+      }
+      if (decision === "published") {
+        // 恢复仅在重算后开放数低于阈值时生效，且只从 hidden 恢复
+        if (report.target_type === "feature") {
+          await client.query(
+            `UPDATE map_features SET status = 'published', updated_at = now()
+             WHERE id = $1 AND status = 'hidden' AND current_revision_id IS NOT NULL AND deleted_at IS NULL`,
+            [report.target_id]
+          );
+        } else {
+          await client.query(
+            `UPDATE comments SET status = 'published', updated_at = now()
+             WHERE id = $1 AND status = 'hidden' AND deleted_at IS NULL`,
+            [report.target_id]
+          );
+        }
+      }
+
+      const finalStatus = await client.query<{ status: string }>(
+        `SELECT status FROM ${table} WHERE id = $1`,
+        [report.target_id]
+      );
+      const targetStatus = finalStatus.rows[0]?.status ?? null;
+
       await recordAudit(client, {
         actorId: request.user!.id,
         action: "report.resolved",
         resourceType: "report",
         resourceId: params.id,
-        metadata: { status: input.status, action: input.action, notes: input.notes, targetType: report.target_type, targetId: report.target_id }
+        metadata: {
+          status: input.status,
+          action: input.action,
+          notes: input.notes,
+          targetType: report.target_type,
+          targetId: report.target_id,
+          openReports,
+          targetStatus,
+          restoreSuppressed: input.action === "restore" && decision !== "published"
+        }
       });
       await notifyUser(client, {
         userId: report.reporter_id,
@@ -378,8 +426,9 @@ export async function moderationRoutes(app: FastifyInstance) {
         body: input.status === "resolved" ? "审核员已完成处理。" : "审核员已完成核查，本次举报被驳回。",
         link: "/me/notifications"
       });
+      return { targetStatus, openReports };
     });
-    return { status: input.status };
+    return { status: input.status, targetStatus: outcome.targetStatus, openReports: outcome.openReports };
   });
 
   app.get("/moderation/audit", { preHandler: requireAdmin }, async (request) => {

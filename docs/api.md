@@ -86,5 +86,5 @@
 | `POST` | `/moderation/comments/:id/approve` | 批准评论 |
 | `POST` | `/moderation/comments/:id/reject` | 拒绝评论 |
 | `POST` | `/moderation/comments/:id/hide` | 隐藏评论 |
-| `POST` | `/moderation/reports/:id/resolve` | 处理举报 |
+| `POST` | `/moderation/reports/:id/resolve` | 处理举报；处置后按剩余开放举报数统一重算目标可见性，`restore` 仅在开放举报低于阈值（3）时生效，响应含 `targetStatus` 与 `openReports` |
 | `GET` | `/moderation/audit` | 管理员审计日志 |
