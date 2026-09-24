@@ -28,6 +28,21 @@ describe("initial migration", () => {
     expect(followup).toContain("updated_at timestamptz");
   });
 
+  it("reconciles over-threshold targets back to hidden in migration 0003", () => {
+    const followup = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../migrations/0003_report_threshold_reconcile.sql"),
+      "utf8"
+    );
+    // 历史口径校正：仍超阈值却 published 的目标回退为 hidden，并写审计
+    expect(followup.match(/SET status = 'hidden'/g)).toHaveLength(2);
+    expect(followup.match(/HAVING count\(\*\) >= 3/g)).toHaveLength(2);
+    expect(followup).toContain("r.status = 'open'");
+    expect(followup).toContain("mf.status = 'published'");
+    expect(followup).toContain("c.status = 'published'");
+    expect(followup.match(/report\.threshold_reconciled/g)!.length).toBeGreaterThanOrEqual(2);
+    expect(followup.match(/INSERT INTO audit_logs/g)).toHaveLength(2);
+  });
+
   it("uses PostGIS geography points and spatial indexes", () => {
     expect(migration).toContain("geography(Point, 4326)");
     expect(migration).toContain("USING gist (geom)");

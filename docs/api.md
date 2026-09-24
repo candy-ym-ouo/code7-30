@@ -82,9 +82,11 @@
 | `POST` | `/moderation/features/:id/reject` | 拒绝 |
 | `POST` | `/moderation/features/:id/request-changes` | 要求修改 |
 | `POST` | `/moderation/features/:id/hide` | 隐藏 |
-| `POST` | `/moderation/features/:id/restore` | 管理员恢复 |
+| `POST` | `/moderation/features/:id/restore` | 管理员恢复；开放举报仍达阈值时返回 409 `REPORT_THRESHOLD_OPEN` |
 | `POST` | `/moderation/comments/:id/approve` | 批准评论 |
 | `POST` | `/moderation/comments/:id/reject` | 拒绝评论 |
 | `POST` | `/moderation/comments/:id/hide` | 隐藏评论 |
-| `POST` | `/moderation/reports/:id/resolve` | 处理举报 |
+| `POST` | `/moderation/reports/:id/resolve` | 处理举报；`action=restore` 时开放举报仍达阈值则整笔回退并返回 409 `REPORT_THRESHOLD_OPEN` |
 | `GET` | `/moderation/audit` | 管理员审计日志 |
+
+统一口径：同一目标的开放举报达到 3 条时必须保持隐藏。所有恢复路径在执行前按当前开放举报数重算，仍达阈值时整笔事务回退并返回 409 `REPORT_THRESHOLD_OPEN`；被拦截的恢复尝试和历史口径校正（迁移 `0003`）都会写入审计日志。

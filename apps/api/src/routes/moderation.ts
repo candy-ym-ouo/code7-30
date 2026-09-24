@@ -6,6 +6,13 @@ import { AppError, conflict, notFound } from "../errors";
 import { requireAdmin, requireModerator } from "../auth";
 import { recordAudit } from "../audit";
 import { notifyUser } from "../notifications";
+import {
+  applyReportThreshold,
+  assertTargetRestorable,
+  isReportThresholdOpen,
+  lockReportTarget,
+  type ReportTargetType
+} from "../report-threshold";
 
 export async function moderationRoutes(app: FastifyInstance) {
   app.get("/moderation/queue", { preHandler: requireModerator }, async () => {
@@ -235,22 +242,31 @@ export async function moderationRoutes(app: FastifyInstance) {
 
   app.post("/moderation/features/:id/restore", { preHandler: requireAdmin }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
-    await transaction(async (client) => {
-      const result = await client.query<{ current_revision_id: string | null }>(
-        "SELECT current_revision_id FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
-        [params.id]
-      );
-      const feature = result.rows[0];
-      if (!feature) throw notFound("Feature not found");
-      if (!feature.current_revision_id) throw conflict("Feature has no approved revision");
-      await client.query("UPDATE map_features SET status = 'published', updated_at = now() WHERE id = $1", [params.id]);
-      await recordAudit(client, {
-        actorId: request.user!.id,
-        action: "feature.restored",
-        resourceType: "feature",
-        resourceId: params.id
+    try {
+      await transaction(async (client) => {
+        const result = await client.query<{ current_revision_id: string | null }>(
+          "SELECT current_revision_id FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+          [params.id]
+        );
+        const feature = result.rows[0];
+        if (!feature) throw notFound("Feature not found");
+        if (!feature.current_revision_id) throw conflict("Feature has no approved revision");
+        // 统一口径：开放举报仍超阈值时禁止恢复，整笔事务回退
+        await assertTargetRestorable(client, "feature", params.id);
+        await client.query("UPDATE map_features SET status = 'published', updated_at = now() WHERE id = $1", [params.id]);
+        await recordAudit(client, {
+          actorId: request.user!.id,
+          action: "feature.restored",
+          resourceType: "feature",
+          resourceId: params.id
+        });
       });
-    });
+    } catch (error) {
+      if (isReportThresholdOpen(error)) {
+        await recordBlockedRestore(request.user!.id, "feature", params.id, error);
+      }
+      throw error;
+    }
     return { status: "published" };
   });
 
@@ -340,45 +356,66 @@ export async function moderationRoutes(app: FastifyInstance) {
       notes: z.string().trim().max(1000).optional()
     }).parse(request.body);
 
-    await transaction(async (client) => {
-      const reportResult = await client.query<{ target_type: string; target_id: string; reporter_id: string }>(
-        "SELECT target_type, target_id, reporter_id FROM reports WHERE id = $1 AND status = 'open' FOR UPDATE",
-        [params.id]
-      );
-      const report = reportResult.rows[0];
-      if (!report) throw notFound("Open report not found");
+    try {
+      await transaction(async (client) => {
+        const reportResult = await client.query<{ target_type: ReportTargetType; target_id: string; reporter_id: string }>(
+          "SELECT target_type, target_id, reporter_id FROM reports WHERE id = $1 AND status = 'open' FOR UPDATE",
+          [params.id]
+        );
+        const report = reportResult.rows[0];
+        if (!report) throw notFound("Open report not found");
 
-      if (input.action === "hide") {
-        const table = report.target_type === "feature" ? "map_features" : "comments";
-        await client.query(`UPDATE ${table} SET status = 'hidden', updated_at = now() WHERE id = $1`, [report.target_id]);
-      }
-      if (input.action === "restore") {
-        if (report.target_type === "feature") {
-          await client.query("UPDATE map_features SET status = 'published', updated_at = now() WHERE id = $1 AND current_revision_id IS NOT NULL", [report.target_id]);
-        } else {
-          await client.query("UPDATE comments SET status = 'published', updated_at = now() WHERE id = $1", [report.target_id]);
+        // 与举报创建和其他处置串行化，保证阈值判定基于同一口径
+        await lockReportTarget(client, report.target_type, report.target_id);
+
+        if (input.action === "hide") {
+          const table = report.target_type === "feature" ? "map_features" : "comments";
+          await client.query(`UPDATE ${table} SET status = 'hidden', updated_at = now() WHERE id = $1 AND deleted_at IS NULL`, [report.target_id]);
         }
-      }
 
-      await client.query(
-        `UPDATE reports SET status = $2, resolved_by = $3, resolved_at = now() WHERE id = $1`,
-        [params.id, input.status, request.user!.id]
-      );
-      await recordAudit(client, {
-        actorId: request.user!.id,
-        action: "report.resolved",
-        resourceType: "report",
-        resourceId: params.id,
-        metadata: { status: input.status, action: input.action, notes: input.notes, targetType: report.target_type, targetId: report.target_id }
+        await client.query(
+          `UPDATE reports SET status = $2, resolved_by = $3, resolved_at = now() WHERE id = $1`,
+          [params.id, input.status, request.user!.id]
+        );
+
+        if (input.action === "restore") {
+          // 统一重算：开放举报仍超阈值时抛出 409，整笔处置（含举报状态）回退
+          await assertTargetRestorable(client, report.target_type, report.target_id);
+          if (report.target_type === "feature") {
+            await client.query("UPDATE map_features SET status = 'published', updated_at = now() WHERE id = $1 AND current_revision_id IS NOT NULL", [report.target_id]);
+          } else {
+            await client.query("UPDATE comments SET status = 'published', updated_at = now() WHERE id = $1", [report.target_id]);
+          }
+        } else {
+          // 统一重算：处置后仍超阈值的目标保持或回退为隐藏
+          await applyReportThreshold(client, {
+            targetType: report.target_type,
+            targetId: report.target_id,
+            actorId: null
+          });
+        }
+
+        await recordAudit(client, {
+          actorId: request.user!.id,
+          action: "report.resolved",
+          resourceType: "report",
+          resourceId: params.id,
+          metadata: { status: input.status, action: input.action, notes: input.notes, targetType: report.target_type, targetId: report.target_id }
+        });
+        await notifyUser(client, {
+          userId: report.reporter_id,
+          type: "report_resolved",
+          title: "你的举报已处理",
+          body: input.status === "resolved" ? "审核员已完成处理。" : "审核员已完成核查，本次举报被驳回。",
+          link: "/me/notifications"
+        });
       });
-      await notifyUser(client, {
-        userId: report.reporter_id,
-        type: "report_resolved",
-        title: "你的举报已处理",
-        body: input.status === "resolved" ? "审核员已完成处理。" : "审核员已完成核查，本次举报被驳回。",
-        link: "/me/notifications"
-      });
-    });
+    } catch (error) {
+      if (isReportThresholdOpen(error)) {
+        await recordBlockedRestore(request.user!.id, "report", params.id, error);
+      }
+      throw error;
+    }
     return { status: input.status };
   });
 
@@ -412,4 +449,22 @@ async function activePendingRevision(client: Parameters<Parameters<typeof transa
   const revision = result.rows[0];
   if (!revision) throw notFound("Pending revision not found");
   return revision;
+}
+
+/**
+ * 恢复被阈值拦截后事务已回退，单独补写审计，留痕被拦截的恢复尝试。
+ */
+async function recordBlockedRestore(actorId: string, resourceType: string, resourceId: string, error: AppError) {
+  const metadata = typeof error.details === "object" && error.details !== null
+    ? error.details as Record<string, unknown>
+    : {};
+  await transaction(async (client) => {
+    await recordAudit(client, {
+      actorId,
+      action: `${resourceType}.restore_blocked`,
+      resourceType,
+      resourceId,
+      metadata
+    });
+  });
 }

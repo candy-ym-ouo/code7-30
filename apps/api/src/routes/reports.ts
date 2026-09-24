@@ -4,8 +4,8 @@ import { reportCreateSchema } from "@map/shared/contracts";
 import { query, transaction } from "../db";
 import { AppError, conflict, notFound } from "../errors";
 import { requireAuth } from "../auth";
-import { recordAudit } from "../audit";
 import { notifyUser } from "../notifications";
+import { applyReportThreshold } from "../report-threshold";
 
 export async function reportRoutes(app: FastifyInstance) {
   app.post("/reports", { preHandler: requireAuth }, async (request, reply) => {
@@ -14,14 +14,14 @@ export async function reportRoutes(app: FastifyInstance) {
       let ownerId: string | null = null;
       if (input.targetType === "feature") {
         const target = await client.query<{ owner_id: string; status: string }>(
-          "SELECT owner_id, status FROM map_features WHERE id = $1 AND deleted_at IS NULL",
+          "SELECT owner_id, status FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
           [input.targetId]
         );
         if (!target.rows[0] || target.rows[0].status !== "published") throw notFound("Feature not found");
         ownerId = target.rows[0].owner_id;
       } else {
         const target = await client.query<{ author_id: string; status: string }>(
-          "SELECT author_id, status FROM comments WHERE id = $1 AND deleted_at IS NULL",
+          "SELECT author_id, status FROM comments WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
           [input.targetId]
         );
         if (!target.rows[0] || target.rows[0].status !== "published") throw notFound("Comment not found");
@@ -39,25 +39,11 @@ export async function reportRoutes(app: FastifyInstance) {
         throw error;
       });
 
-      const count = await client.query<{ count: number }>(
-        `SELECT count(*)::int AS count FROM reports
-         WHERE target_type = $1 AND target_id = $2 AND status = 'open'`,
-        [input.targetType, input.targetId]
-      );
-      if (count.rows[0]!.count >= 3) {
-        if (input.targetType === "feature") {
-          await client.query("UPDATE map_features SET status = 'hidden', updated_at = now() WHERE id = $1", [input.targetId]);
-        } else {
-          await client.query("UPDATE comments SET status = 'hidden', updated_at = now() WHERE id = $1", [input.targetId]);
-        }
-        await recordAudit(client, {
-          actorId: null,
-          action: "report.threshold_hidden",
-          resourceType: input.targetType,
-          resourceId: input.targetId,
-          metadata: { openReports: count.rows[0]!.count }
-        });
-      }
+      await applyReportThreshold(client, {
+        targetType: input.targetType,
+        targetId: input.targetId,
+        actorId: null
+      });
       if (ownerId && ownerId !== request.user!.id) {
         await notifyUser(client, {
           userId: ownerId,
